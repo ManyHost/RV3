@@ -1,4 +1,4 @@
-# RV3 – Quantum-Resistant Encrypted Container
+# RV3
 
 ## Container & Key Architecture
 
