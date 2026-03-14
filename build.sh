@@ -181,7 +181,8 @@ $CC $BUILD_FLAGS \
     $LFLAGS \
     $SODIUM_FLAGS \
     $CURL_FLAGS \
-    $ELF_FLAGS
+    $ELF_FLAGS \
+    -lm
 
 echo "==> Compiled: $OUT"
 
