@@ -53,6 +53,35 @@
 #include <sodium.h>
 #include <curl/curl.h>
 #include <limits.h>
+#include <math.h>  /* log() */
+
+/* ================================================================== */
+/* Forward declarations — functions/types used before their definition */
+/* in this single-translation-unit build.                              */
+/* ================================================================== */
+/* Types first — needed by the function forward decls below */
+typedef struct{uint8_t *d;size_t sz,cap;}BB;
+typedef struct{char label[4096];char pw[31];}KeyEntry;
+typedef struct{KeyEntry *entries;size_t cnt,cap;}KeyFile;
+/* KF wire-format constants used in wfile_pair() before #undef/redefine block */
+#define KF_MAGIC        "RVKF\x02"
+#define KF_MAGIC_LEN    5
+#define KF_EC_LEN       4
+#define KF_OUTER_MAC_LEN 32
+/* Function forward decls */
+__attribute__((noreturn)) static void die(const char *m);
+static uint8_t *rfile(const char *path, size_t *sz);
+static void fast_kdf(uint8_t *key, const char *pw, const uint8_t *salt);
+static void kf_outer_mac(uint8_t *mac, const uint8_t *data, size_t data_len, const uint8_t *salt);
+static void kf_write_enc_to(const KeyFile *kf, const char *path, const char *master_pw);
+static uint8_t *rv_compress(const uint8_t *in, size_t il, size_t *ol);
+static uint8_t *rv_decompress(const uint8_t *in, size_t il, size_t *ol);
+static uint8_t *make_decoy_archive(const char *decoy_source, const char *base,
+                                    KeyFile *kf, pthread_mutex_t *kf_mu, size_t *out_sz);
+static void bb_init(BB *b);
+static void bb_need(BB *b,size_t x);
+static void bb_app(BB *b,const void *s,size_t l);
+static void bb_free(BB *b);
 
 /* ================================================================== */
 /* Constants                                                            */
@@ -1854,7 +1883,7 @@ static void pw_strength_check(const char *pw, int allow_weak){
 /* Password input with --stdin-pw support                              */
 /* g_stdin_pw=1 reads from stdin; 0 reads from /dev/tty (default)     */
 /* ================================================================== */
-
+static uint8_t *rfile(const char *path, size_t *sz){
     struct stat st;
     if(stat(path,&st)!=0){dprintf(STDERR_FILENO,"rv: cannot stat: %s (%s)\n",path,strerror(errno));die("S");}
     if(st.st_size<0){dprintf(STDERR_FILENO,"rv: negative size: %s\n",path);die("L");}
@@ -1988,7 +2017,7 @@ static char *plat_https_get(const char *url){
     curl_easy_setopt(c,CURLOPT_WRITEDATA,&r);
     curl_easy_setopt(c,CURLOPT_TIMEOUT,10L);
     curl_easy_setopt(c,CURLOPT_FOLLOWLOCATION,1L);
-    curl_easy_setopt(c,CURLOPT_PROTOCOLS,CURLPROTO_HTTPS);
+    curl_easy_setopt(c,CURLOPT_PROTOCOLS_STR,"https");
     CURLcode res=curl_easy_perform(c);
     long hc=0; curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,&hc);
     curl_easy_cleanup(c);
@@ -2210,7 +2239,7 @@ static void gen_password(char out[FILE_PW_LEN+1]){
 /* ================================================================== */
 /* Growable buffer                                                      */
 /* ================================================================== */
-typedef struct{uint8_t *d;size_t sz,cap;}BB;
+/* BB typedef is at top of file — definitions only here */
 static void bb_init(BB *b){b->cap=64*1024;b->sz=0;b->d=malloc(b->cap);if(!b->d)die("B");}
 static void bb_need(BB *b,size_t x){while(b->sz+x>b->cap){b->cap*=2;uint8_t*nb=realloc(b->d,b->cap);if(!nb)die("B");b->d=nb;}}
 static void bb_app(BB *b,const void *s,size_t l){bb_need(b,l);memcpy(b->d+b->sz,s,l);b->sz+=l;}
@@ -2533,8 +2562,7 @@ static uint8_t *rv_decompress(const uint8_t *in, size_t il, size_t *ol)
 /* ================================================================== */
 /* Key file                                                             */
 /* ================================================================== */
-typedef struct{char label[MAX_PATH_LEN];char pw[FILE_PW_LEN+1];}KeyEntry;
-typedef struct{KeyEntry *entries;size_t cnt,cap;}KeyFile;
+/* KeyEntry / KeyFile typedefs are at top of file — definitions only here */
 
 static void kf_init(KeyFile *kf){kf->cap=64;kf->cnt=0;kf->entries=malloc(kf->cap*sizeof(KeyEntry));if(!kf->entries)die("N");}
 static void kf_add(KeyFile *kf,const char *label,const char *pw){
@@ -2749,6 +2777,8 @@ static void fail_count_reset(void){ g_fail_count=0; }
 /* ================================================================== */
 #undef  KF_MAGIC
 #undef  KF_MAGIC_LEN
+#undef  KF_EC_LEN
+#undef  KF_OUTER_MAC_LEN
 #define KF_MAGIC      "RVKF\x02"
 #define KF_MAGIC_LEN  5
 #define KF_EC_LEN     4          /* entry count field */
@@ -3230,29 +3260,7 @@ static void kf_write_enc_to(const KeyFile *kf, const char *path, const char *mas
 /* The checkpoint is deleted on successful completion.                 */
 /* ================================================================== */
 #define CKPT_SUFFIX "_root.ckpt"
-
-typedef struct{ char **names; size_t cnt,cap; } CkptSet;
-static void ckpt_init(CkptSet *c){ c->cap=64;c->cnt=0;c->names=malloc(c->cap*sizeof(char*));if(!c->names)die("N"); }
-static void ckpt_free(CkptSet *c){ for(size_t i=0;i<c->cnt;i++)free(c->names[i]);free(c->names);c->names=NULL;c->cnt=c->cap=0; }
-static int  ckpt_has(const CkptSet *c, const char *name){
-    for(size_t i=0;i<c->cnt;i++) if(!strcmp(c->names[i],name)) return 1; return 0;
-}
-static void ckpt_add(CkptSet *c, const char *name){
-    if(c->cnt>=c->cap){c->cap*=2;c->names=realloc(c->names,c->cap*sizeof(char*));if(!c->names)die("N");}
-    c->names[c->cnt++]=strdup(name);
-}
-static void ckpt_read(CkptSet *c, const char *ckpt_path){
-    ckpt_init(c); FILE *f=fopen(ckpt_path,"r"); if(!f)return;
-    char line[MAX_PATH_LEN];
-    while(fgets(line,sizeof(line),f)){
-        size_t l=strlen(line); if(l>0&&line[l-1]=='\n')line[--l]='\0'; if(l)ckpt_add(c,line);
-    }
-    fclose(f);
-}
-static void ckpt_record(const char *ckpt_path, const char *cont_name){
-    FILE *f=fopen(ckpt_path,"a"); if(!f)return;
-    fprintf(f,"%s\n",cont_name); fclose(f);
-}
+/* ckpt_init/free/has/add/read are defined above using the Ckpt type (~line 1790) */
 
 /* ================================================================== */
 /* list: enumerate files inside a container without writing to disk   */
